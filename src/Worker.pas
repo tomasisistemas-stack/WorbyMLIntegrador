@@ -39,7 +39,8 @@ procedure TWorker.ImportarPedidos;
 var
   Orders: TJSONArray;
   I: Integer;
-  OrderId: string;
+  OrderId, ShipmentId: string;
+  ShipValue: TJSONValue;
   Detail: TJSONObject;
 begin
   Orders := FClient.SearchPaidOrders;
@@ -53,6 +54,36 @@ begin
       OrderId := TJSONObject(Orders.Items[I]).GetValue('id').Value;
       Detail := FClient.GetOrder(OrderId);
       try
+        // CPF/CNPJ so e buscado para pedidos ainda nao importados, para poupar requisicoes
+        if not FRepo.JaImportado(OrderId) then
+        begin
+          try
+            Detail.AddPair('doc_comprador', FClient.GetBillingDoc(OrderId));
+          except
+            on E: Exception do
+              FLog.Error('Falha ao obter CPF/CNPJ do pedido ' + OrderId + ': ' + E.Message);
+          end;
+
+          // Endereco de entrega do comprador (receiver_address do envio).
+          // Pedidos sem envio (ex.: retirada) trazem shipping.id = null: nesse caso nao consulta.
+          ShipmentId := '';
+          if Detail.GetValue('shipping') is TJSONObject then
+          begin
+            ShipValue := TJSONObject(Detail.GetValue('shipping')).GetValue('id');
+            if (ShipValue <> nil) and not (ShipValue is TJSONNull) then
+              ShipmentId := ShipValue.Value;
+          end;
+
+          if ShipmentId <> '' then
+          begin
+            try
+              Detail.AddPair('endereco_comprador', FClient.GetReceiverAddress(ShipmentId));
+            except
+              on E: Exception do
+                FLog.Error('Falha ao obter endereco do pedido ' + OrderId + ': ' + E.Message);
+            end;
+          end;
+        end;
         FRepo.UpsertPedido(Detail);
       finally
         Detail.Free;
@@ -96,8 +127,8 @@ begin
       if FConfig.ImportarPedidos then
         ImportarPedidos;
 
-      if FConfig.EnviarNotas then
-        EnviarNotas;
+{      if FConfig.EnviarNotas then
+        EnviarNotas;}
     except
       on E: Exception do
         FLog.Error(E.Message);

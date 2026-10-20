@@ -30,6 +30,8 @@ type
     destructor Destroy; override;
     function SearchPaidOrders: TJSONArray;
     function GetOrder(const OrderId: string): TJSONObject;
+    function GetBillingDoc(const OrderId: string): string;
+    function GetReceiverAddress(const ShipmentId: string): TJSONObject;
     procedure SendInvoiceXml(const PackId, ShipmentId, XmlText: string);
   end;
 
@@ -162,6 +164,51 @@ end;
 function TMercadoLivreClient.GetOrder(const OrderId: string): TJSONObject;
 begin
   Result := GetJson('/orders/' + TNetEncoding.URL.Encode(OrderId));
+end;
+
+// Retorna o receiver_address do envio (endereco de entrega do comprador); objeto vazio se nao houver
+// O chamador passa a posse do objeto retornado (ex.: ao AddPair no pedido)
+function TMercadoLivreClient.GetReceiverAddress(const ShipmentId: string): TJSONObject;
+var
+  Obj: TJSONObject;
+  Addr: TJSONValue;
+begin
+  Obj := GetJson('/shipments/' + TNetEncoding.URL.Encode(ShipmentId));
+  try
+    Addr := Obj.GetValue('receiver_address');
+    if Addr is TJSONObject then
+      Result := TJSONObject(Addr.Clone)
+    else
+      Result := TJSONObject.Create;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// Retorna somente os digitos do CPF/CNPJ do comprador (endpoint billing_info do pedido)
+function TMercadoLivreClient.GetBillingDoc(const OrderId: string): string;
+var
+  Obj, Info: TJSONObject;
+  Raw: string;
+  I: Integer;
+begin
+  Result := '';
+  Obj := GetJson('/orders/' + TNetEncoding.URL.Encode(OrderId) + '/billing_info');
+  try
+    Info := Obj;
+    if Obj.GetValue('billing_info') is TJSONObject then
+      Info := TJSONObject(Obj.GetValue('billing_info'));
+
+    Raw := '';
+    if Info.GetValue('doc_number') <> nil then
+      Raw := Info.GetValue('doc_number').Value;
+
+    for I := 1 to Length(Raw) do
+      if CharInSet(Raw[I], ['0'..'9']) then
+        Result := Result + Raw[I];
+  finally
+    Obj.Free;
+  end;
 end;
 
 procedure TMercadoLivreClient.SendInvoiceXml(const PackId, ShipmentId, XmlText: string);
