@@ -9,6 +9,7 @@ uses
   System.JSON,
   System.Net.URLClient,
   System.Net.HttpClient,
+  System.Net.Mime,
   System.NetEncoding,
   AppConfig,
   Logger;
@@ -31,7 +32,9 @@ type
     function SearchPaidOrders: TJSONArray;
     function GetOrder(const OrderId: string): TJSONObject;
     function GetBillingDoc(const OrderId: string): string;
+    function GetBillingEndereco(const OrderId: string): TJSONObject;
     function GetReceiverAddress(const ShipmentId: string): TJSONObject;
+    function NFeJaEnviada(const PackId, ShipmentId: string): Boolean;
     procedure SendInvoiceXml(const PackId, ShipmentId, XmlText: string);
   end;
 
@@ -211,33 +214,156 @@ begin
   end;
 end;
 
+// Verifica no Mercado Livre se ja existe NF-e para o pack (ou, sem pack, para o envio).
+// Retorna True se houver nota; False se nao houver (404 ou lista vazia).
+// Qualquer outro erro e lancado, para nao enviar as cegas.
+function TMercadoLivreClient.NFeJaEnviada(const PackId, ShipmentId: string): Boolean;
+var
+  Url: string;
+  Resp: IHTTPResponse;
+  Json: TJSONValue;
+  Obj: TJSONObject;
+  Lista: TJSONValue;
+begin
+  Result := False;
+
+  if (Trim(PackId) <> '') and (Trim(PackId) <> 'null') then
+    Url := 'https://api.mercadolibre.com/packs/' + TNetEncoding.URL.Encode(PackId) + '/fiscal_documents'
+  else if (Trim(ShipmentId) <> '') and (Trim(ShipmentId) <> 'null') then
+    Url := 'https://api.mercadolibre.com/shipments/' + TNetEncoding.URL.Encode(ShipmentId) + '/invoice_data?siteId=' + FConfig.SiteId
+  else
+    Exit;
+
+  Resp := FHttp.Get(Url, nil, [TNameValuePair.Create('Authorization', AuthHeader)]);
+
+  if Resp.StatusCode = 404 then
+    Exit;
+
+  if (Resp.StatusCode < 200) or (Resp.StatusCode > 299) then
+    raise Exception.CreateFmt('Consulta de NF-e no Mercado Livre retornou %d: %s',
+      [Resp.StatusCode, Resp.ContentAsString(TEncoding.UTF8)]);
+
+  Json := TJSONObject.ParseJSONValue(Resp.ContentAsString(TEncoding.UTF8));
+  try
+    if Json is TJSONArray then
+      Result := TJSONArray(Json).Count > 0
+    else if Json is TJSONObject then
+    begin
+      Obj := TJSONObject(Json);
+      // Algumas respostas trazem a lista dentro de 'results'
+      Lista := Obj.GetValue('results');
+      if Lista is TJSONArray then
+        Result := TJSONArray(Lista).Count > 0
+      else
+        Result := (Obj.Count > 0) and (Obj.GetValue('error') = nil);
+    end;
+  finally
+    Json.Free;
+  end;
+end;
+
+// Endereco do comprador a partir do billing_info do pedido (additional_info).
+// Retorna objeto vazio se nao houver endereco; o formato e o mesmo de endereco_comprador
+function TMercadoLivreClient.GetBillingEndereco(const OrderId: string): TJSONObject;
+var
+  Obj, Info, Item, Sub: TJSONObject;
+  Lista: TJSONValue;
+  I: Integer;
+  Tipo, Valor, Rua, Numero, Cep, Bairro, Cidade, Uf: string;
+begin
+  Result := TJSONObject.Create;
+  Obj := GetJson('/orders/' + TNetEncoding.URL.Encode(OrderId) + '/billing_info');
+  try
+    Info := Obj;
+    if Obj.GetValue('billing_info') is TJSONObject then
+      Info := TJSONObject(Obj.GetValue('billing_info'));
+
+    Lista := Info.GetValue('additional_info');
+    if not (Lista is TJSONArray) then
+      Exit;
+
+    Rua := ''; Numero := ''; Cep := ''; Bairro := ''; Cidade := ''; Uf := '';
+    for I := 0 to TJSONArray(Lista).Count - 1 do
+    begin
+      if not (TJSONArray(Lista).Items[I] is TJSONObject) then
+        Continue;
+      Item := TJSONObject(TJSONArray(Lista).Items[I]);
+      Tipo := Item.GetValue('type').Value;
+      Valor := Item.GetValue('value').Value;
+
+      if Tipo = 'STREET_NAME' then Rua := Valor
+      else if Tipo = 'STREET_NUMBER' then Numero := Valor
+      else if Tipo = 'ZIP_CODE' then Cep := Valor
+      else if Tipo = 'NEIGHBORHOOD' then Bairro := Valor
+      else if Tipo = 'CITY_NAME' then Cidade := Valor
+      else if Tipo = 'STATE_CODE' then Uf := Valor;   // ex.: BR-PA
+    end;
+
+    if Rua = '' then
+      Exit;
+
+    Result.AddPair('street_name', Rua);
+    Result.AddPair('street_number', Numero);
+    Result.AddPair('zip_code', Cep);
+    Sub := TJSONObject.Create;
+    Sub.AddPair('name', Bairro);
+    Result.AddPair('neighborhood', Sub);
+    Sub := TJSONObject.Create;
+    Sub.AddPair('name', Cidade);
+    Result.AddPair('city', Sub);
+    Sub := TJSONObject.Create;
+    Sub.AddPair('id', Uf);
+    Result.AddPair('state', Sub);
+  finally
+    Obj.Free;
+  end;
+end;
+
 procedure TMercadoLivreClient.SendInvoiceXml(const PackId, ShipmentId, XmlText: string);
 var
   Url: string;
   Source: TStringStream;
+  MP: TMultipartFormData;
   Resp: IHTTPResponse;
 begin
-  if Trim(PackId) <> '' then
+  if (Trim(PackId) <> '') and (Trim(PackId) <> 'null') then
     Url := 'https://api.mercadolibre.com/packs/' + TNetEncoding.URL.Encode(PackId) + '/fiscal_documents'
-  else if Trim(ShipmentId) <> '' then
+  else if (Trim(ShipmentId) <> '') and (Trim(ShipmentId) <> 'null') then
     Url := 'https://api.mercadolibre.com/shipments/' + TNetEncoding.URL.Encode(ShipmentId) + '/invoice_data?siteId=' + FConfig.SiteId
   else
     raise Exception.Create('Pedido sem pack_id/shipment_id para envio de NF-e');
 
-  Source := TStringStream.Create(XmlText, TEncoding.UTF8);
-  try
-    Resp := FHttp.Post(Url, Source, nil,
-      [TNameValuePair.Create('Authorization', AuthHeader),
-       TNameValuePair.Create('Content-Type', 'application/xml')]);
-
-    if (Resp.StatusCode < 200) or (Resp.StatusCode > 299) then
-      raise Exception.CreateFmt('Envio de NF-e ao Mercado Livre retornou %d: %s',
-        [Resp.StatusCode, Resp.ContentAsString(TEncoding.UTF8)]);
-
-    FLog.Info('NF-e enviada ao Mercado Livre');
-  finally
-    Source.Free;
+  if (Trim(PackId) <> '') and (Trim(PackId) <> 'null') then
+  begin
+    // pack/fiscal_documents exige multipart/form-data, com o XML enviado como arquivo
+    MP := TMultipartFormData.Create;
+    Source := TStringStream.Create(XmlText, TEncoding.UTF8);
+    try
+      MP.AddStream('fiscal_document', Source, 'nfe.xml', 'application/xml');
+      Resp := FHttp.Post(Url, MP, nil,
+        [TNameValuePair.Create('Authorization', AuthHeader)]);
+    finally
+      MP.Free;
+      Source.Free;
+    end;
+  end
+  else
+  begin
+    Source := TStringStream.Create(XmlText, TEncoding.UTF8);
+    try
+      Resp := FHttp.Post(Url, Source, nil,
+        [TNameValuePair.Create('Authorization', AuthHeader),
+         TNameValuePair.Create('Content-Type', 'application/xml')]);
+    finally
+      Source.Free;
+    end;
   end;
+
+  if (Resp.StatusCode < 200) or (Resp.StatusCode > 299) then
+    raise Exception.CreateFmt('Envio de NF-e ao Mercado Livre retornou %d: %s',
+      [Resp.StatusCode, Resp.ContentAsString(TEncoding.UTF8)]);
+
+  FLog.Info('NF-e enviada ao Mercado Livre');
 end;
 
 end.

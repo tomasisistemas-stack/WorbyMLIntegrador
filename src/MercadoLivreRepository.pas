@@ -1,4 +1,4 @@
-unit MercadoLivreRepository;
+﻿unit MercadoLivreRepository;
 
 interface
 
@@ -22,11 +22,16 @@ type
     function FindOrCreateCliente(const OrderJson: TJSONObject): Integer;
     function CreateVendas1(const OrderJson: TJSONObject; const CodCliente: Integer): Integer;
     procedure CreateVendas2(const NumDoc: Integer; const OrderJson: TJSONObject);
+    function CfopVenda(const CodCliente: Integer): string;
+    procedure DadosFiscaisItem(const CodCliente, CodProduto: Integer;
+      out Ncm, Cest, TribIcms, CodFiscal: string; out PesoUnit, CustoTotal: Double);
   public
     constructor Create(Connection: TFDConnection; const Config: TAppConfig; Log: TLogger);
     procedure UpsertPedido(const OrderJson: TJSONObject);
     function JaImportado(const OrderId: string): Boolean;
     procedure ImportarPendentes;
+    function PrecisaEndereco(const OrderId: string): Boolean;
+    procedure ReprocessarSeSemEndereco(const OrderId: string);
     procedure CriarPendenciasNFe;
     function NextNFePendente(out Id: Integer; out PackId, ShipmentId, XmlText: string): Boolean;
     procedure MarkNFeEnviada(const Id: Integer);
@@ -132,6 +137,36 @@ begin
   end;
 end;
 
+// Converte para maiusculas e remove acentos (ex.: 'Itaboraí' -> 'ITABORAI')
+// Trata letras minusculas acentuadas e acentos decompostos (caractere combinante)
+function SemAcento(const S: string): string;
+const
+  Com = #$00C1#$00C0#$00C2#$00C3#$00C4#$00C9#$00C8#$00CA#$00CB#$00CD#$00CC#$00CE#$00CF +
+        #$00D3#$00D2#$00D4#$00D5#$00D6#$00DA#$00D9#$00DB#$00DC#$00C7#$00D1;
+  Sem = 'AAAAAEEEEIIIIOOOOOUUUUCN';
+var
+  I, P, N: Integer;
+  C: Char;
+begin
+  Result := '';
+  for I := 1 to Length(S) do
+  begin
+    C := S[I];
+    N := Ord(C);
+    // acento decomposto (letra + acento combinante): descarta o acento
+    if (N >= $0300) and (N <= $036F) then
+      Continue;
+    // minuscula acentuada (Latin-1) -> maiuscula
+    if (N >= $00E0) and (N <= $00FE) and (N <> $00F7) then
+      C := Char(N - $20);
+    P := Pos(C, Com);
+    if P > 0 then
+      C := Sem[P];
+    Result := Result + C;
+  end;
+  Result := UpperCase(Result);
+end;
+
 function TMercadoLivreRepository.FindOrCreateCliente(const OrderJson: TJSONObject): Integer;
 var
   Q: TFDQuery;
@@ -199,7 +234,7 @@ begin
   Compl := Copy(Compl, 1, 40);
   Cep := Copy(Cep, 1, 10);
   Bairro := Copy(Bairro, 1, 30);
-  NomeCid := Copy(NomeCid, 1, 40);
+  NomeCid := SemAcento(Copy(NomeCid, 1, 40));
 
   // 11 digitos = CPF (pessoa fisica); 14 digitos = CNPJ (pessoa juridica)
   if Length(Doc) = 11 then
@@ -288,6 +323,10 @@ begin
       Q.Open;
       Result := Q.FieldByName('cod_cliente').AsInteger;
     end;
+
+    // Grava o cliente agora (commit proprio), para ficar mesmo se a venda falhar
+    if FConn.InTransaction then
+      FConn.Commit;
   finally
     Q.Free;
   end;
@@ -299,6 +338,7 @@ var
   OrderId, PackId, DataCriacao, DtStr, HoraStr, Obs: string;
   Total: Double;
   NumDocExistente: Integer;
+  CodFiscal: string;
 begin
   OrderId := JsonStr(OrderJson, 'id');
   PackId := JsonStr(OrderJson, 'pack_id');
@@ -314,41 +354,37 @@ begin
   try
     Q.Connection := FConn;
 
-    // Numdoc ja vinculado a este pedido (importado em uma execucao anterior)
-    Q.SQL.Text := 'select numdoc from ml_pedido where order_id = :order_id';
-    Q.ParamByName('order_id').AsString := OrderId;
+    // CFOP da venda pela regra do ERP (UF cliente x UF empresa) e validacao do cliente
+    CodFiscal := CfopVenda(CodCliente);
+
+    // Venda ja existente no ERP com o mesmo cliente, data e total, ainda nao faturada
+    Q.SQL.Text :=
+      'select numdoc from vendas1 ' +
+      'where empresa_faturar = :empresa and cod_cliente = :cod_cliente ' +
+      '  and round(tot_liquido,0) = round(cast(:tot as numeric(15,4)), 0) '+
+      'order by numdoc limit 1';
+    Q.ParamByName('empresa').AsInteger := FConfig.CodEmpresa;
+    Q.ParamByName('cod_cliente').AsInteger := CodCliente;
+    Q.ParamByName('tot').AsFloat := Total;
     Q.Open;
     NumDocExistente := 0;
-    if (not Q.IsEmpty) and (not Q.FieldByName('numdoc').IsNull) then
+    if not Q.IsEmpty then
       NumDocExistente := Q.FieldByName('numdoc').AsInteger;
     Q.Close;
 
     if NumDocExistente > 0 then
     begin
-      // 1) UPSERT (update): so altera cod_cliente, dtadoc e tot_liquido quando houver diferenca,
-      //    e somente se a venda ainda nao estiver faturada
-      Q.SQL.Text :=
-        'update vendas1 set cod_cliente = :cod_cliente, dtadoc = cast(:dtadoc as date), tot_liquido = :tot ' +
-        'where numdoc = :numdoc and cod_empresa = :empresa and coalesce(faturado, 0) = 0 ' +
-        '  and (cod_cliente is distinct from :cod_cliente ' +
-        '    or dtadoc is distinct from cast(:dtadoc as date) ' +
-        '    or tot_liquido is distinct from :tot)';
-      Q.ParamByName('cod_cliente').AsInteger := CodCliente;
-      Q.ParamByName('dtadoc').AsString := DtStr;
-      Q.ParamByName('tot').AsFloat := Total;
-      Q.ParamByName('numdoc').AsInteger := NumDocExistente;
-      Q.ParamByName('empresa').AsInteger := FConfig.CodEmpresa;
-      Q.ExecSQL;
+      // Registro encontrado com cod_cliente, dtadoc e tot_liquido iguais: usa esta venda
       Result := NumDocExistente;
     end
     else
     begin
       // 2) INSERT: cria a venda e recupera o numdoc gerado
       Q.SQL.Text :=
-        'insert into vendas1 (dtadoc, hora, cod_cliente, cod_empresa, cod_representante, cod_fop, ' +
-        'cod_prazo_pgto, tot_bruto, tot_liquido, vlr_tot_nf, faturado, pedido, observacoes_pedido) ' +
-        'values (cast(:dtadoc as date), cast(:hora as time), :cod_cliente, :empresa, :representante, :fop, ' +
-        ':prazo, :tot, :tot, :tot, 0, ''N'', :obs) ' +
+        'insert into vendas1 (dtadoc, hora, cod_cliente, cod_empresa, empresa_faturar, cod_representante, cod_fop, ' +
+        'cod_prazo_pgto, cod_fiscal, tot_bruto, tot_liquido, vlr_tot_nf, faturado, pedido, observacoes_pedido) ' +
+        'values (cast(:dtadoc as date), cast(:hora as time), :cod_cliente, :empresa, :empresa, :representante, :fop, ' +
+        ':prazo, :cfop, :tot, :tot, :tot, 0, ''N'', :obs) ' +
         'returning numdoc';
       Q.ParamByName('dtadoc').AsString := DtStr;
       Q.ParamByName('hora').AsString := HoraStr;
@@ -359,6 +395,7 @@ begin
       Q.ParamByName('prazo').AsInteger := FConfig.CodPrazoPgto;
       Q.ParamByName('tot').AsFloat := Total;
       Q.ParamByName('obs').AsString := Obs;
+      Q.ParamByName('cfop').AsString := CodFiscal;
       Q.Open;
       Result := Q.FieldByName('numdoc').AsInteger;
     end;
@@ -377,6 +414,9 @@ var
   CodProduto: Integer;
   Qtd, PrecoUnit, PrecoBruto: Double;
   Existe: Boolean;
+  CodCliente: Integer;
+  Ncm, Cest, TribIcms, CodFiscal: string;
+  PesoUnit, CustoTotal: Double;
 begin
   if not (OrderJson.GetValue('order_items') is TJSONArray) then
     Exit;
@@ -388,13 +428,14 @@ begin
 
     // Venda ja faturada nao e alterada
     Q.SQL.Text :=
-      'select coalesce(faturado, 0) as faturado from vendas1 ' +
+      'select coalesce(faturado, 0) as faturado, cod_cliente from vendas1 ' +
       'where numdoc = :numdoc and cod_empresa = :empresa';
     Q.ParamByName('numdoc').AsInteger := NumDoc;
     Q.ParamByName('empresa').AsInteger := FConfig.CodEmpresa;
     Q.Open;
     if Q.IsEmpty or (Q.FieldByName('faturado').AsInteger <> 0) then
       Exit;
+    CodCliente := Q.FieldByName('cod_cliente').AsInteger;
     Q.Close;
 
     for I := 0 to Itens.Count - 1 do
@@ -423,6 +464,9 @@ begin
       if PrecoBruto <= 0 then
         PrecoBruto := PrecoUnit;
 
+      // Dados fiscais e de peso do produto (mesma regra do ERP em dados_produto)
+      DadosFiscaisItem(CodCliente, CodProduto, Ncm, Cest, TribIcms, CodFiscal, PesoUnit, CustoTotal);
+
       // Item ja gravado para esta venda e produto?
       Q.SQL.Text :=
         'select 1 from vendas2 where numdoc = :numdoc and cod_empresa = :empresa and cod_produto = :prod';
@@ -438,7 +482,9 @@ begin
         // 1) UPSERT (update): so quando quantidade ou preco mudaram
         Q.SQL.Text :=
           'update vendas2 set qtd = :qtd, preco = :preco, preco_base = :bruto, preco_bruto = :bruto, ' +
-          '  sub_total = :sub, sub_total_bruto = :subbruto, desconto_valor = :desc ' +
+          '  sub_total = :sub, sub_total_bruto = :subbruto, desconto_valor = :desc, ' +
+          '  ncm = :ncm, cest = :cest, trib_icms = :trib, cod_fiscal_item = :cfop, ' +
+          '  preco_custo = :custo ' +
           'where numdoc = :numdoc and cod_empresa = :empresa and cod_produto = :prod ' +
           '  and (qtd is distinct from :qtd or preco is distinct from :preco)';
       end
@@ -447,12 +493,14 @@ begin
         // 2) INSERT: dtadoc e cod_cliente vem da venda (vendas1)
         Q.SQL.Text :=
           'insert into vendas2 (numdoc, dtadoc, cod_produto, cod_cliente, cod_representante, cod_empresa, ' +
-          '  qtd, preco, preco_base, preco_bruto, sub_total, sub_total_bruto, desconto_valor) ' +
+          '  qtd, preco, preco_base, preco_bruto, sub_total, sub_total_bruto, desconto_valor, ' +
+          '  ncm, cest, trib_icms, cod_fiscal_item, preco_custo) ' +
           'values (:numdoc, ' +
           '  (select v.dtadoc from vendas1 v where v.numdoc = :numdoc and v.cod_empresa = :empresa), ' +
           '  :prod, ' +
           '  (select v.cod_cliente from vendas1 v where v.numdoc = :numdoc and v.cod_empresa = :empresa), ' +
-          '  :representante, :empresa, :qtd, :preco, :bruto, :bruto, :sub, :subbruto, :desc)';
+          '  :representante, :empresa, :qtd, :preco, :bruto, :bruto, :sub, :subbruto, :desc, ' +
+          '  :ncm, :cest, :trib, :cfop, :custo)';
         Q.ParamByName('representante').AsInteger := FConfig.CodRepresentante;
       end;
 
@@ -465,8 +513,106 @@ begin
       Q.ParamByName('sub').AsFloat := PrecoUnit * Qtd;
       Q.ParamByName('subbruto').AsFloat := PrecoBruto * Qtd;
       Q.ParamByName('desc').AsFloat := (PrecoBruto - PrecoUnit) * Qtd;
+      Q.ParamByName('ncm').AsString := Ncm;
+      Q.ParamByName('cest').AsString := Cest;
+      Q.ParamByName('trib').AsString := TribIcms;
+      Q.ParamByName('cfop').AsString := CodFiscal;
+      Q.ParamByName('custo').AsFloat := CustoTotal;
       Q.ExecSQL;
     end;
+  finally
+    Q.Free;
+  end;
+end;
+
+// CFOP da venda, pela mesma regra do ERP: UF do cliente x UF da empresa (industria = 5101/6101; demais = 5102/6102).
+// Tambem valida o cliente: pre-cadastrado ou sem inscricao estadual nao podem ser faturados.
+// CFOP da venda, pela mesma regra do ERP: UF do cliente x UF da empresa (industria = 5101/6101; demais = 5102/6102).
+// Tambem valida o cliente: pre-cadastrado ou sem inscricao estadual nao podem ser faturados.
+function TMercadoLivreRepository.CfopVenda(const CodCliente: Integer): string;
+var
+  Q: TFDQuery;
+  UFCli, UFEmi: string;
+  Industria: Boolean;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'select cd.uf as uf_cliente, c.pre_cadastro, c.ie, ' +
+      '  (select cc.uf from empresa e inner join cidades cc on cc.cod_cidade = e.cod_cidade ' +
+      '   where e.cod_empresa = :empresa) as uf_emissor, ' +
+      '  (select e.industria from empresa e where e.cod_empresa = :empresa) as industria ' +
+      'from cliente c left join cidades cd on cd.cod_cidade = c.cod_cidade ' +
+      'where c.cod_cliente = :cliente';
+    Q.ParamByName('empresa').AsInteger := FConfig.CodEmpresa;
+    Q.ParamByName('cliente').AsInteger := CodCliente;
+    Q.Open;
+
+    if Q.IsEmpty then
+      raise Exception.CreateFmt('Cliente %d nao encontrado', [CodCliente]);
+    if Q.FieldByName('pre_cadastro').AsString = 'S' then
+      raise Exception.Create('Cliente pre-cadastrado nao pode ser faturado');
+
+    UFCli := Q.FieldByName('uf_cliente').AsString;
+    UFEmi := Q.FieldByName('uf_emissor').AsString;
+    if (UFCli = '') or (UFEmi = '') then
+      raise Exception.Create('UF do cliente ou da empresa nao cadastrada (CFOP nao definido)');
+
+    Industria := Q.FieldByName('industria').AsString = 'S';
+    if Industria then
+    begin
+      if UFCli = UFEmi then Result := '5101' else Result := '6101';
+    end
+    else
+    begin
+      if UFCli = UFEmi then Result := '5102' else Result := '6102';
+    end;
+  finally
+    Q.Free;
+  end;
+end;
+
+// Dados fiscais e de peso do produto, como o ERP faz em dados_produto.
+// Produto inativo, sem NCM ou com trib_icms diferente de '0' (ST) gera erro, para o pedido nao ser emitido errado.
+procedure TMercadoLivreRepository.DadosFiscaisItem(const CodCliente, CodProduto: Integer;
+  out Ncm, Cest, TribIcms, CodFiscal: string; out PesoUnit, CustoTotal: Double);
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'select p.status, p.peso, p.custo_total, ' +
+      '  coalesce(coalesce(n.codigo, p.ncm), g.ncm) as ncm, ' +
+      '  coalesce(n.cest, coalesce(p.cest, g.cest)) as cest, ' +
+      '  coalesce(p.trib_icms, n.trib_icms) as trib_icms ' +
+      'from produto p ' +
+      'left join grupo g on g.cod_grupo = p.cod_grupo ' +
+      'left join ncm n on n.codigo = coalesce(p.ncm, g.ncm) and n.cest = coalesce(p.cest, g.cest) ' +
+      'where p.cod_produto = :prod';
+    Q.ParamByName('prod').AsInteger := CodProduto;
+    Q.Open;
+
+    if Q.IsEmpty then
+      raise Exception.CreateFmt('Produto %d nao cadastrado', [CodProduto]);
+    if Q.FieldByName('status').AsString <> 'N' then
+      raise Exception.CreateFmt('Produto %d inativo', [CodProduto]);
+
+    Ncm := Q.FieldByName('ncm').AsString;
+    if Ncm = '' then
+      raise Exception.CreateFmt('Produto %d sem NCM', [CodProduto]);
+    Cest := Q.FieldByName('cest').AsString;
+
+    TribIcms := Q.FieldByName('trib_icms').AsString;
+    if TribIcms <> '0' then
+      raise Exception.CreateFmt('Produto %d com trib_icms=%s: substituicao tributaria ainda nao tratada',
+        [CodProduto, TribIcms]);
+
+    CodFiscal := CfopVenda(CodCliente);
+    PesoUnit := Q.FieldByName('peso').AsFloat;
+    CustoTotal := Q.FieldByName('custo_total').AsFloat;
   finally
     Q.Free;
   end;
@@ -483,6 +629,47 @@ begin
     Q.ParamByName('order_id').AsString := OrderId;
     Q.Open;
     Result := not Q.IsEmpty;
+  finally
+    Q.Free;
+  end;
+end;
+
+// True se o pedido tem cliente sem endereco (o endereco do comprador ainda precisa ser buscado)
+function TMercadoLivreRepository.PrecisaEndereco(const OrderId: string): Boolean;
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'select 1 from ml_pedido mp ' +
+      'join vendas1 v on v.numdoc = mp.numdoc ' +
+      'join cliente c on c.cod_cliente = v.cod_cliente ' +
+      'where mp.order_id = :order_id and coalesce(c.endereco, '''') = ''''';
+    Q.ParamByName('order_id').AsString := OrderId;
+    Q.Open;
+    Result := not Q.IsEmpty;
+  finally
+    Q.Free;
+  end;
+end;
+
+// Pedido ja importado cujo cliente continua sem endereco volta para PENDENTE, para o ImportarPendentes atualizar o cliente
+procedure TMercadoLivreRepository.ReprocessarSeSemEndereco(const OrderId: string);
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'update ml_pedido mp set import_status = ''PENDENTE'' ' +
+      'where mp.order_id = :order_id and mp.import_status = ''IMPORTADO'' ' +
+      '  and exists (select 1 from vendas1 v join cliente c on c.cod_cliente = v.cod_cliente ' +
+      '              where v.numdoc = mp.numdoc and coalesce(c.endereco, '''') = '''')';
+    Q.ParamByName('order_id').AsString := OrderId;
+    Q.ExecSQL;
   finally
     Q.Free;
   end;
@@ -512,7 +699,9 @@ begin
         Obj := TJSONObject(Json);
         FConn.StartTransaction;
         try
-          CodCliente := FindOrCreateCliente(Obj);
+          CodCliente := FindOrCreateCliente(Obj);   // ja grava o cliente com commit
+
+          FConn.StartTransaction;
           NumDoc := CreateVendas1(Obj, CodCliente);
           CreateVendas2(NumDoc, Obj);
 

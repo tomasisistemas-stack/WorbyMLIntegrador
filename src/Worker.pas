@@ -19,6 +19,7 @@ type
     FClient: TMercadoLivreClient;
     FRepo: TMercadoLivreRepository;
     procedure ImportarPedidos;
+    function PagamentoRecusado(Detail: TJSONObject): Boolean;
     procedure EnviarNotas;
   public
     constructor Create(const Config: TAppConfig; Log: TLogger; Client: TMercadoLivreClient; Repo: TMercadoLivreRepository);
@@ -35,6 +36,35 @@ begin
   FRepo := Repo;
 end;
 
+// True se o pedido NAO tem nenhum pagamento aprovado e tem pelo menos um recusado
+function TWorker.PagamentoRecusado(Detail: TJSONObject): Boolean;
+var
+  Pagamentos: TJSONValue;
+  I: Integer;
+  Status: string;
+  TemRecusado, TemAprovado: Boolean;
+begin
+  Result := False;
+  Pagamentos := Detail.GetValue('payments');
+  if not (Pagamentos is TJSONArray) then
+    Exit;
+
+  TemRecusado := False;
+  TemAprovado := False;
+  for I := 0 to TJSONArray(Pagamentos).Count - 1 do
+  begin
+    if not (TJSONArray(Pagamentos).Items[I] is TJSONObject) then
+      Continue;
+    Status := TJSONObject(TJSONArray(Pagamentos).Items[I]).GetValue('status').Value;
+    if SameText(Status, 'approved') then
+      TemAprovado := True
+    else if SameText(Status, 'rejected') then
+      TemRecusado := True;
+  end;
+
+  Result := TemRecusado and not TemAprovado;
+end;
+
 procedure TWorker.ImportarPedidos;
 var
   Orders: TJSONArray;
@@ -42,6 +72,8 @@ var
   OrderId, ShipmentId: string;
   ShipValue: TJSONValue;
   Detail: TJSONObject;
+  JaImp, Precisa, EnderecoObtido: Boolean;
+  Addr: TJSONObject;
 begin
   Orders := FClient.SearchPaidOrders;
   try
@@ -54,8 +86,19 @@ begin
       OrderId := TJSONObject(Orders.Items[I]).GetValue('id').Value;
       Detail := FClient.GetOrder(OrderId);
       try
-        // CPF/CNPJ so e buscado para pedidos ainda nao importados, para poupar requisicoes
-        if not FRepo.JaImportado(OrderId) then
+        // Pedido com pagamento recusado nao e importado
+        if PagamentoRecusado(Detail) then
+        begin
+          FLog.Info('Pedido ' + OrderId + ' ignorado: pagamento recusado');
+          Continue;
+        end;
+
+        JaImp := FRepo.JaImportado(OrderId);
+        // Pedido novo: CPF/CNPJ e endereco. Pedido ja importado: so endereco, se o cliente ainda nao tem
+        Precisa := (not JaImp) or FRepo.PrecisaEndereco(OrderId);
+        EnderecoObtido := False;
+
+        if not JaImp then
         begin
           try
             Detail.AddPair('doc_comprador', FClient.GetBillingDoc(OrderId));
@@ -63,9 +106,11 @@ begin
             on E: Exception do
               FLog.Error('Falha ao obter CPF/CNPJ do pedido ' + OrderId + ': ' + E.Message);
           end;
+        end;
 
-          // Endereco de entrega do comprador (receiver_address do envio).
-          // Pedidos sem envio (ex.: retirada) trazem shipping.id = null: nesse caso nao consulta.
+        if Precisa then
+        begin
+          // Pedidos sem envio (ex.: retirada) trazem shipping.id = null: nesse caso nao consulta
           ShipmentId := '';
           if Detail.GetValue('shipping') is TJSONObject then
           begin
@@ -74,17 +119,48 @@ begin
               ShipmentId := ShipValue.Value;
           end;
 
+          // 1) receiver_address do envio
           if ShipmentId <> '' then
           begin
             try
-              Detail.AddPair('endereco_comprador', FClient.GetReceiverAddress(ShipmentId));
+              Addr := FClient.GetReceiverAddress(ShipmentId);
+              if Addr.Count > 0 then
+              begin
+                Detail.AddPair('endereco_comprador', Addr);
+                EnderecoObtido := True;
+              end
+              else
+                Addr.Free;
             except
               on E: Exception do
                 FLog.Error('Falha ao obter endereco do pedido ' + OrderId + ': ' + E.Message);
             end;
           end;
+
+          // 2) endereco do billing_info, quando o envio nao traz endereco
+          if not EnderecoObtido then
+          begin
+            try
+              Addr := FClient.GetBillingEndereco(OrderId);
+              if Addr.Count > 0 then
+              begin
+                Detail.AddPair('endereco_comprador', Addr);
+                EnderecoObtido := True;
+              end
+              else
+                Addr.Free;
+            except
+              on E: Exception do
+                FLog.Error('Falha ao obter endereco de cobranca do pedido ' + OrderId + ': ' + E.Message);
+            end;
+          end;
         end;
+
         FRepo.UpsertPedido(Detail);
+
+        // Pedido ja importado com endereco novo obtido: reprocessa para atualizar o cliente
+        if JaImp and EnderecoObtido then
+          FRepo.ReprocessarSeSemEndereco(OrderId);
       finally
         Detail.Free;
       end;
@@ -100,22 +176,30 @@ procedure TWorker.EnviarNotas;
 var
   Id: Integer;
   PackId, ShipmentId, XmlText: string;
+  JaEnviada: Boolean;
 begin
   FRepo.CriarPendenciasNFe;
 
   while FRepo.NextNFePendente(Id, PackId, ShipmentId, XmlText) do
   begin
     try
-      FClient.SendInvoiceXml(PackId, ShipmentId, XmlText);
-      FRepo.MarkNFeEnviada(Id);
+      // Consulta o Mercado Livre antes de enviar, para nao duplicar a NF-e
+      JaEnviada := FClient.NFeJaEnviada(PackId, ShipmentId);
+      if JaEnviada then
+        FLog.Info('NF-e ja existe no Mercado Livre (id ' + IntToStr(Id) + '), nao reenviada')
+      else
+        FClient.SendInvoiceXml(PackId, ShipmentId, XmlText);
     except
       on E: Exception do
       begin
         FRepo.MarkNFeErro(Id, E.Message);
-        FLog.Error('Falha ao enviar NF-e ao Mercado Livre: ' + E.Message);
+        FLog.Error('Falha ao enviar NF-e ao Mercado Livre (id ' + IntToStr(Id) + '): ' + E.Message);
         Break;
       end;
     end;
+
+    // Fora do try de envio: se falhar aqui, a nota nao vira ERRO e nao e reenviada indevidamente
+    FRepo.MarkNFeEnviada(Id);
   end;
 end;
 
@@ -127,8 +211,8 @@ begin
       if FConfig.ImportarPedidos then
         ImportarPedidos;
 
-{      if FConfig.EnviarNotas then
-        EnviarNotas;}
+      if FConfig.EnviarNotas then
+        EnviarNotas;
     except
       on E: Exception do
         FLog.Error(E.Message);
