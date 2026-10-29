@@ -34,6 +34,7 @@ type
     function GetBillingDoc(const OrderId: string): string;
     function GetBillingEndereco(const OrderId: string): TJSONObject;
     function GetReceiverAddress(const ShipmentId: string): TJSONObject;
+    function GetFreteVendedor(const ShipmentId: string): Double;
     function NFeJaEnviada(const PackId, ShipmentId: string): Boolean;
     procedure SendInvoiceXml(const PackId, ShipmentId, XmlText: string);
   end;
@@ -183,6 +184,33 @@ begin
       Result := TJSONObject(Addr.Clone)
     else
       Result := TJSONObject.Create;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// Custo do envio pago pelo vendedor (senders[0].cost de /shipments/{id}/costs)
+function TMercadoLivreClient.GetFreteVendedor(const ShipmentId: string): Double;
+var
+  Obj: TJSONObject;
+  Senders: TJSONArray;
+  Sender: TJSONObject;
+  V: TJSONValue;
+begin
+  Result := 0;
+  Obj := GetJson('/shipments/' + TNetEncoding.URL.Encode(ShipmentId) + '/costs');
+  try
+    if Obj.GetValue('senders') is TJSONArray then
+    begin
+      Senders := TJSONArray(Obj.GetValue('senders'));
+      if (Senders.Count > 0) and (Senders.Items[0] is TJSONObject) then
+      begin
+        Sender := TJSONObject(Senders.Items[0]);
+        V := Sender.GetValue('cost');
+        if V is TJSONNumber then
+          Result := TJSONNumber(V).AsDouble;
+      end;
+    end;
   finally
     Obj.Free;
   end;

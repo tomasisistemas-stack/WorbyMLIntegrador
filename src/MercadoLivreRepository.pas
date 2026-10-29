@@ -4,7 +4,10 @@ interface
 
 uses
   System.SysUtils,
+  System.Variants,
+  System.DateUtils,
   System.JSON,
+  Data.DB,
   FireDAC.Comp.Client,
   FireDAC.DApt,
   FireDAC.Stan.Param,
@@ -19,6 +22,8 @@ type
     FLog: TLogger;
     function JsonStr(Obj: TJSONObject; const Name: string): string;
     function JsonFloat(Obj: TJSONObject; const Name: string): Double;
+    function TaxaMlPedido(const OrderJson: TJSONObject): Double;
+    procedure SetFechamentoParams(Q: TFDQuery; const OrderJson: TJSONObject);
     function FindOrCreateCliente(const OrderJson: TJSONObject): Integer;
     function CreateVendas1(const OrderJson: TJSONObject; const CodCliente: Integer): Integer;
     procedure CreateVendas2(const NumDoc: Integer; const OrderJson: TJSONObject);
@@ -29,6 +34,7 @@ type
     constructor Create(Connection: TFDConnection; const Config: TAppConfig; Log: TLogger);
     procedure UpsertPedido(const OrderJson: TJSONObject);
     function JaImportado(const OrderId: string): Boolean;
+    function FreteFaltando(const OrderId: string): Boolean;
     procedure ImportarPendentes;
     function PrecisaEndereco(const OrderId: string): Boolean;
     procedure ReprocessarSeSemEndereco(const OrderId: string);
@@ -60,6 +66,80 @@ end;
 function TMercadoLivreRepository.JsonFloat(Obj: TJSONObject; const Name: string): Double;
 begin
   Result := StrToFloatDef(StringReplace(JsonStr(Obj, Name), '.', FormatSettings.DecimalSeparator, []), 0);
+end;
+
+// Soma sale_fee x quantity de todos os itens do pedido (taxa do Mercado Livre)
+function TMercadoLivreRepository.TaxaMlPedido(const OrderJson: TJSONObject): Double;
+var
+  Items: TJSONArray;
+  Item: TJSONObject;
+  I: Integer;
+  Qtd: Double;
+begin
+  Result := 0;
+  if not (OrderJson.GetValue('order_items') is TJSONArray) then
+    Exit;
+  Items := TJSONArray(OrderJson.GetValue('order_items'));
+  for I := 0 to Items.Count - 1 do
+  begin
+    if not (Items.Items[I] is TJSONObject) then
+      Continue;
+    Item := TJSONObject(Items.Items[I]);
+    Qtd := JsonFloat(Item, 'quantity');
+    Result := Result + JsonFloat(Item, 'sale_fee') * Qtd;
+  end;
+end;
+
+// Preenche data_fechamento (horario local), taxa_ml e taxa_frete
+procedure TMercadoLivreRepository.SetFechamentoParams(Q: TFDQuery; const OrderJson: TJSONObject);
+var
+  FechaStr: string;
+  Frete: Double;
+begin
+  FechaStr := JsonStr(OrderJson, 'date_closed');
+  // Valor NULL com tipo definido depois: o FireDAC so prepara o parametro se o tipo estiver explicito (erro -335)
+  Q.ParamByName('data_fechamento').Value := Null;
+  Q.ParamByName('data_fechamento').DataType := ftDateTime;
+  if FechaStr <> '' then
+  begin
+    try
+      Q.ParamByName('data_fechamento').AsDateTime := ISO8601ToDate(FechaStr, False);
+    except
+      on E: Exception do
+        FLog.Error('date_closed invalido no pedido ' + JsonStr(OrderJson, 'id') + ': ' + FechaStr);
+    end;
+  end;
+
+  Q.ParamByName('taxa_ml').AsFloat := TaxaMlPedido(OrderJson);
+
+  // Frete vem de /shipments/{id}/costs (campo frete_vendedor); sem ele, fica nulo e o update mantem o valor gravado
+  if OrderJson.GetValue('frete_vendedor') is TJSONNumber then
+  begin
+    Frete := TJSONNumber(OrderJson.GetValue('frete_vendedor')).AsDouble;
+    Q.ParamByName('taxa_frete').AsFloat := Frete;
+  end
+  else
+  begin
+    Q.ParamByName('taxa_frete').Value := Null;
+    Q.ParamByName('taxa_frete').DataType := ftFloat;
+  end;
+end;
+
+// True se o pedido ja existe e ainda nao tem frete gravado (taxa_frete nula ou zero)
+function TMercadoLivreRepository.FreteFaltando(const OrderId: string): Boolean;
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text := 'select 1 from ml_pedido where order_id = :order_id and coalesce(taxa_frete, 0) = 0';
+    Q.ParamByName('order_id').AsString := OrderId;
+    Q.Open;
+    Result := not Q.IsEmpty;
+  finally
+    Q.Free;
+  end;
 end;
 
 procedure TMercadoLivreRepository.UpsertPedido(const OrderJson: TJSONObject);
@@ -100,7 +180,8 @@ begin
     Q.SQL.Text :=
       'update ml_pedido set pack_id = :pack_id, shipment_id = :shipment_id, status = :status, ' +
       'buyer_id = :buyer_id, buyer_name = :buyer_name, total_amount = :total_amount, ' +
-      'paid_amount = :paid_amount, raw_json = :raw_json, atualizado_em = current_timestamp ' +
+      'paid_amount = :paid_amount, data_fechamento = :data_fechamento, taxa_ml = :taxa_ml, ' +
+      'taxa_frete = coalesce(:taxa_frete, taxa_frete), raw_json = :raw_json, atualizado_em = current_timestamp ' +
       'where order_id = :order_id';
     Q.ParamByName('order_id').AsString := OrderId;
     Q.ParamByName('pack_id').AsString := PackId;
@@ -110,6 +191,7 @@ begin
     Q.ParamByName('buyer_name').AsString := Copy(BuyerName, 1, 160);
     Q.ParamByName('total_amount').AsFloat := JsonFloat(OrderJson, 'total_amount');
     Q.ParamByName('paid_amount').AsFloat := JsonFloat(OrderJson, 'paid_amount');
+    SetFechamentoParams(Q, OrderJson);
     Q.ParamByName('raw_json').Size := Length(RawJson) + 16;
     Q.ParamByName('raw_json').AsString := RawJson;
     Q.ExecSQL;
@@ -118,8 +200,10 @@ begin
     begin
       Q.SQL.Text :=
         'insert into ml_pedido ' +
-        '(order_id, pack_id, shipment_id, status, buyer_id, buyer_name, total_amount, paid_amount, raw_json, atualizado_em) ' +
-        'values (:order_id, :pack_id, :shipment_id, :status, :buyer_id, :buyer_name, :total_amount, :paid_amount, :raw_json, current_timestamp)';
+        '(order_id, pack_id, shipment_id, status, buyer_id, buyer_name, total_amount, paid_amount, ' +
+        'data_fechamento, taxa_ml, taxa_frete, raw_json, atualizado_em) ' +
+        'values (:order_id, :pack_id, :shipment_id, :status, :buyer_id, :buyer_name, :total_amount, :paid_amount, ' +
+        ':data_fechamento, :taxa_ml, :taxa_frete, :raw_json, current_timestamp)';
       Q.ParamByName('order_id').AsString := OrderId;
       Q.ParamByName('pack_id').AsString := PackId;
       Q.ParamByName('shipment_id').AsString := ShipmentId;
@@ -128,6 +212,7 @@ begin
       Q.ParamByName('buyer_name').AsString := Copy(BuyerName, 1, 160);
       Q.ParamByName('total_amount').AsFloat := JsonFloat(OrderJson, 'total_amount');
       Q.ParamByName('paid_amount').AsFloat := JsonFloat(OrderJson, 'paid_amount');
+      SetFechamentoParams(Q, OrderJson);
       Q.ParamByName('raw_json').Size := Length(RawJson) + 16;
       Q.ParamByName('raw_json').AsString := RawJson;
       Q.ExecSQL;

@@ -72,7 +72,7 @@ var
   OrderId, ShipmentId: string;
   ShipValue: TJSONValue;
   Detail: TJSONObject;
-  JaImp, Precisa, EnderecoObtido: Boolean;
+  JaImp, Precisa, EnderecoObtido, BuscaFrete: Boolean;
   Addr: TJSONObject;
 begin
   Orders := FClient.SearchPaidOrders;
@@ -97,6 +97,8 @@ begin
         // Pedido novo: CPF/CNPJ e endereco. Pedido ja importado: so endereco, se o cliente ainda nao tem
         Precisa := (not JaImp) or FRepo.PrecisaEndereco(OrderId);
         EnderecoObtido := False;
+        // Frete pago pelo vendedor: busca em pedidos novos e nos ja importados sem frete gravado
+        BuscaFrete := (not JaImp) or FRepo.FreteFaltando(OrderId);
 
         if not JaImp then
         begin
@@ -156,6 +158,26 @@ begin
           end;
         end;
 
+        if BuscaFrete then
+        begin
+          ShipmentId := '';
+          if Detail.GetValue('shipping') is TJSONObject then
+          begin
+            ShipValue := TJSONObject(Detail.GetValue('shipping')).GetValue('id');
+            if (ShipValue <> nil) and not (ShipValue is TJSONNull) then
+              ShipmentId := ShipValue.Value;
+          end;
+          if ShipmentId <> '' then
+          begin
+            try
+              Detail.AddPair('frete_vendedor', TJSONNumber.Create(FClient.GetFreteVendedor(ShipmentId)));
+            except
+              on E: Exception do
+                FLog.Error('Falha ao obter frete do pedido ' + OrderId + ': ' + E.Message);
+            end;
+          end;
+        end;
+
         FRepo.UpsertPedido(Detail);
 
         // Pedido ja importado com endereco novo obtido: reprocessa para atualizar o cliente
@@ -211,8 +233,8 @@ begin
       if FConfig.ImportarPedidos then
         ImportarPedidos;
 
-      if FConfig.EnviarNotas then
-        EnviarNotas;
+     { if FConfig.EnviarNotas then
+        EnviarNotas;}
     except
       on E: Exception do
         FLog.Error(E.Message);
