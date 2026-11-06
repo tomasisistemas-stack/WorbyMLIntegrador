@@ -30,18 +30,24 @@ type
     function CfopVenda(const CodCliente: Integer): string;
     procedure DadosFiscaisItem(const CodCliente, CodProduto: Integer;
       out Ncm, Cest, TribIcms, CodFiscal: string; out PesoUnit, CustoTotal: Double);
+    function BuscaAliquotaICMS(const CodCliente: Integer; const Ncm, Cest: string): Double;
+    function PedidoFaturado(const numdoc: integer): Boolean;
   public
     constructor Create(Connection: TFDConnection; const Config: TAppConfig; Log: TLogger);
     procedure UpsertPedido(const OrderJson: TJSONObject);
     function JaImportado(const OrderId: string): Boolean;
     function FreteFaltando(const OrderId: string): Boolean;
     procedure ImportarPendentes;
+    procedure SolicitarEmissaoNFe(const NumDoc: Integer; const OrderId: string);
+    function TaxasPreenchidas(const OrderId: string): Boolean;
+    procedure SolicitarEmissaoPendentes;
     function PrecisaEndereco(const OrderId: string): Boolean;
     procedure ReprocessarSeSemEndereco(const OrderId: string);
     procedure CriarPendenciasNFe;
     function NextNFePendente(out Id: Integer; out PackId, ShipmentId, XmlText: string): Boolean;
     procedure MarkNFeEnviada(const Id: Integer);
     procedure MarkNFeErro(const Id: Integer; const Msg: string);
+    procedure MarkNFeEmitidaML(const Id: Integer);
   end;
 
 implementation
@@ -194,7 +200,12 @@ begin
     SetFechamentoParams(Q, OrderJson);
     Q.ParamByName('raw_json').Size := Length(RawJson) + 16;
     Q.ParamByName('raw_json').AsString := RawJson;
-    Q.ExecSQL;
+    try
+      Q.ExecSQL;
+    except
+      on E: Exception do
+        raise Exception.Create('Pedido ' + OrderId + ' (update ml_pedido): ' + E.Message);
+    end;
 
     if Q.RowsAffected = 0 then
     begin
@@ -215,7 +226,12 @@ begin
       SetFechamentoParams(Q, OrderJson);
       Q.ParamByName('raw_json').Size := Length(RawJson) + 16;
       Q.ParamByName('raw_json').AsString := RawJson;
-      Q.ExecSQL;
+      try
+        Q.ExecSQL;
+      except
+        on E: Exception do
+          raise Exception.Create('Pedido ' + OrderId + ' (insert ml_pedido): ' + E.Message);
+      end;
     end;
   finally
     Q.Free;
@@ -250,6 +266,33 @@ begin
     Result := Result + C;
   end;
   Result := UpperCase(Result);
+end;
+
+// CPF (11 digitos) com mascara 000.000.000-00; CNPJ (14 digitos) com mascara 00.000.000/0000-00
+function MascaraDoc(const Doc: string): string;
+begin
+  case Length(Doc) of
+    11: Result := Copy(Doc, 1, 3) + '.' + Copy(Doc, 4, 3) + '.' + Copy(Doc, 7, 3) + '-' + Copy(Doc, 10, 2);
+    14: Result := Copy(Doc, 1, 2) + '.' + Copy(Doc, 3, 3) + '.' + Copy(Doc, 6, 3) + '/' + Copy(Doc, 9, 4) + '-' + Copy(Doc, 13, 2);
+  else
+    Result := Doc;
+  end;
+end;
+
+// CEP com mascara 00000-000 (somente digitos; se nao tiver 8 digitos, mantem como veio)
+function MascaraCep(const Cep: string): string;
+var
+  Digitos: string;
+  I: Integer;
+begin
+  Digitos := '';
+  for I := 1 to Length(Cep) do
+    if CharInSet(Cep[I], ['0'..'9']) then
+      Digitos := Digitos + Cep[I];
+  if Length(Digitos) = 8 then
+    Result := Copy(Digitos, 1, 5) + '-' + Copy(Digitos, 6, 3)
+  else
+    Result := Cep;
 end;
 
 function TMercadoLivreRepository.FindOrCreateCliente(const OrderJson: TJSONObject): Integer;
@@ -355,6 +398,8 @@ begin
       Q.Close;
       Q.SQL.Text :=
         'update cliente set ' +
+        '  cpf = case when :tipo = ''F'' then :docfmt else cpf end, ' +
+        '  cnpj = case when :tipo = ''J'' then :docfmt else cnpj end, ' +
         '  nom_cliente = coalesce(nullif(trim(nom_cliente), ''''), :nome), ' +
         '  nom_fantasia = coalesce(nullif(trim(nom_fantasia), ''''), :fantasia), ' +
         '  endereco = coalesce(nullif(trim(endereco), ''''), :rua), ' +
@@ -366,13 +411,15 @@ begin
         '    (select c.cod_cidade from cidades c where upper(c.nom_cidade) = upper(:cid) and c.uf = :uf ' +
         '     order by c.cod_cidade limit 1)) ' +
         'where cod_cliente = :cod';
+      Q.ParamByName('tipo').AsString := TipoPessoa;
+      Q.ParamByName('docfmt').AsString := MascaraDoc(Doc);
       Q.ParamByName('nome').AsString := Nome;
       Q.ParamByName('fantasia').AsString := Fantasia;
       Q.ParamByName('rua').AsString := Rua;
       Q.ParamByName('numero').AsString := Numero;
       Q.ParamByName('compl').AsString := Compl;
       Q.ParamByName('bairro').AsString := Bairro;
-      Q.ParamByName('cep').AsString := Cep;
+      Q.ParamByName('cep').AsString := MascaraCep(Cep);
       Q.ParamByName('cid').AsString := NomeCid;
       Q.ParamByName('uf').AsString := UF;
       Q.ParamByName('cod').AsInteger := Result;
@@ -393,13 +440,13 @@ begin
         'returning cod_cliente';
       Q.ParamByName('nome').AsString := Nome;
       Q.ParamByName('fantasia').AsString := Fantasia;
-      Q.ParamByName('doc').AsString := Doc;
+      Q.ParamByName('doc').AsString := MascaraDoc(Doc);
       Q.ParamByName('tipo').AsString := TipoPessoa;
       Q.ParamByName('rua').AsString := Rua;
       Q.ParamByName('numero').AsString := Numero;
       Q.ParamByName('compl').AsString := Compl;
       Q.ParamByName('bairro').AsString := Bairro;
-      Q.ParamByName('cep').AsString := Cep;
+      Q.ParamByName('cep').AsString := MascaraCep(Cep);
       Q.ParamByName('cid').AsString := NomeCid;
       Q.ParamByName('uf').AsString := UF;
       Q.ParamByName('empresa').AsInteger := FConfig.CodEmpresa;
@@ -484,6 +531,12 @@ begin
       Q.Open;
       Result := Q.FieldByName('numdoc').AsInteger;
     end;
+
+    // Solicita a emissao no ORBI so se taxa_ml e taxa_frete do pedido estiverem preenchidas (nao nulas)
+    if TaxasPreenchidas(OrderId) and PedidoFaturado(Result) then
+      SolicitarEmissaoNFe(Result, OrderId)
+    else
+      FLog.Info('Pedido ' + OrderId + ' sem taxa_ml/taxa_frete preenchidas: emissao nao solicitada');
   finally
     Q.Free;
   end;
@@ -502,6 +555,7 @@ var
   CodCliente: Integer;
   Ncm, Cest, TribIcms, CodFiscal: string;
   PesoUnit, CustoTotal: Double;
+  Icms: Double;
 begin
   if not (OrderJson.GetValue('order_items') is TJSONArray) then
     Exit;
@@ -551,6 +605,8 @@ begin
 
       // Dados fiscais e de peso do produto (mesma regra do ERP em dados_produto)
       DadosFiscaisItem(CodCliente, CodProduto, Ncm, Cest, TribIcms, CodFiscal, PesoUnit, CustoTotal);
+      // Aliquota ICMS do item (vendas2.icms_item), usada depois no pICMSInter do XML
+      Icms := BuscaAliquotaICMS(CodCliente, Ncm, Cest);
 
       // Item ja gravado para esta venda e produto?
       Q.SQL.Text :=
@@ -569,7 +625,7 @@ begin
           'update vendas2 set qtd = :qtd, preco = :preco, preco_base = :bruto, preco_bruto = :bruto, ' +
           '  sub_total = :sub, sub_total_bruto = :subbruto, desconto_valor = :desc, ' +
           '  ncm = :ncm, cest = :cest, trib_icms = :trib, cod_fiscal_item = :cfop, ' +
-          '  preco_custo = :custo ' +
+          '  preco_custo = :custo, icms_item = :icms ' +
           'where numdoc = :numdoc and cod_empresa = :empresa and cod_produto = :prod ' +
           '  and (qtd is distinct from :qtd or preco is distinct from :preco)';
       end
@@ -579,13 +635,13 @@ begin
         Q.SQL.Text :=
           'insert into vendas2 (numdoc, dtadoc, cod_produto, cod_cliente, cod_representante, cod_empresa, ' +
           '  qtd, preco, preco_base, preco_bruto, sub_total, sub_total_bruto, desconto_valor, ' +
-          '  ncm, cest, trib_icms, cod_fiscal_item, preco_custo) ' +
+          '  ncm, cest, trib_icms, cod_fiscal_item, preco_custo, icms_item) ' +
           'values (:numdoc, ' +
           '  (select v.dtadoc from vendas1 v where v.numdoc = :numdoc and v.cod_empresa = :empresa), ' +
           '  :prod, ' +
           '  (select v.cod_cliente from vendas1 v where v.numdoc = :numdoc and v.cod_empresa = :empresa), ' +
           '  :representante, :empresa, :qtd, :preco, :bruto, :bruto, :sub, :subbruto, :desc, ' +
-          '  :ncm, :cest, :trib, :cfop, :custo)';
+          '  :ncm, :cest, :trib, :cfop, :custo, :icms)';
         Q.ParamByName('representante').AsInteger := FConfig.CodRepresentante;
       end;
 
@@ -603,6 +659,7 @@ begin
       Q.ParamByName('trib').AsString := TribIcms;
       Q.ParamByName('cfop').AsString := CodFiscal;
       Q.ParamByName('custo').AsFloat := CustoTotal;
+      Q.ParamByName('icms').AsFloat := Icms;
       Q.ExecSQL;
     end;
   finally
@@ -653,6 +710,62 @@ begin
     begin
       if UFCli = UFEmi then Result := '5102' else Result := '6102';
     end;
+  finally
+    Q.Free;
+  end;
+end;
+
+// Aliquota ICMS do item, mesma regra do ERP em BuscaAliquota (Un_vendas_industria2):
+// 1) MVA pelo NCM/CEST e UF origem x destino; 2) senao, tabela ICMS da UF origem x destino.
+function TMercadoLivreRepository.BuscaAliquotaICMS(const CodCliente: Integer; const Ncm, Cest: string): Double;
+var
+  Q: TFDQuery;
+  UFCli, UFEmi: string;
+begin
+  Result := 0;
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'select cd.uf as uf_cliente, ' +
+      '  (select cc.uf from empresa e inner join cidades cc on cc.cod_cidade = e.cod_cidade ' +
+      '   where e.cod_empresa = :empresa) as uf_emissor ' +
+      'from cliente c left join cidades cd on cd.cod_cidade = c.cod_cidade ' +
+      'where c.cod_cliente = :cliente';
+    Q.ParamByName('empresa').AsInteger := FConfig.CodEmpresa;
+    Q.ParamByName('cliente').AsInteger := CodCliente;
+    Q.Open;
+    UFCli := Q.FieldByName('uf_cliente').AsString;
+    UFEmi := Q.FieldByName('uf_emissor').AsString;
+    Q.Close;
+
+    // 1) MVA: aliquota do NCM/CEST para a UF destino
+    Q.SQL.Text :=
+      'select a.aliq_icms from mva a where a.ncm = :ncm and a.cest = :cest ' +
+      '  and a.uf = :uf_cli and a.uf_origem = :uf_emi';
+    Q.ParamByName('ncm').AsString := Ncm;
+    Q.ParamByName('cest').AsString := Cest;
+    Q.ParamByName('uf_cli').AsString := UFCli;
+    Q.ParamByName('uf_emi').AsString := UFEmi;
+    Q.Open;
+    if (not Q.IsEmpty) and (not Q.FieldByName('aliq_icms').IsNull) then
+      Result := Q.FieldByName('aliq_icms').AsFloat
+    else
+    begin
+      Q.Close;
+      // 2) tabela ICMS: aliquota padrao da UF origem x destino
+      Q.SQL.Text :=
+        'select a.icms from icms a where a.uf = :uf_cli and a.uf_origem = :uf_emi';
+      Q.ParamByName('uf_cli').AsString := UFCli;
+      Q.ParamByName('uf_emi').AsString := UFEmi;
+      Q.Open;
+      if not Q.IsEmpty then
+        Result := Q.FieldByName('icms').AsFloat;
+    end;
+
+    if Result <= 0 then
+      FLog.Info('Aliquota ICMS nao encontrada (NCM ' + Ncm + ', cliente ' + IntToStr(CodCliente) +
+        ', ' + UFEmi + ' -> ' + UFCli + '): icms_item = 0');
   finally
     Q.Free;
   end;
@@ -755,6 +868,87 @@ begin
       '              where v.numdoc = mp.numdoc and coalesce(c.endereco, '''') = '''')';
     Q.ParamByName('order_id').AsString := OrderId;
     Q.ExecSQL;
+  finally
+    Q.Free;
+  end;
+end;
+
+// Solicita a emissao automatica da NF-e no ERP ORBI (mesmo efeito do botao NF-e do Un_vendas_industria2)
+// True se o ml_pedido do pedido tem taxa_ml e taxa_frete preenchidas (diferentes de nulo)
+function TMercadoLivreRepository.TaxasPreenchidas(const OrderId: string): Boolean;
+var
+  Q: TFDQuery;
+  TemTaxas: Boolean;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'select 1 from ml_pedido m where m.order_id = :order_id ' +
+      '  and m.taxa_ml is not null and m.taxa_frete is not null ';
+    Q.ParamByName('order_id').AsString := OrderId;
+    Q.Open;
+    Result := not Q.IsEmpty;
+  finally
+    Q.Free;
+  end;
+end;
+
+function TMercadoLivreRepository.PedidoFaturado(const Numdoc: integer): Boolean;
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+      Q.SQL.Text :=
+        'select 1 from vendas1 v ' +
+        'where v.numdoc = :numdoc and v.faturado = 0 ';
+      Q.ParamByName('numdoc').AsInteger := numdoc;
+      Q.Open;
+    Result := not Q.IsEmpty;
+  finally
+    Q.Free;
+  end;
+end;
+
+procedure TMercadoLivreRepository.SolicitarEmissaoNFe(const NumDoc: Integer; const OrderId: string);
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'update vendas1 set status_emissor = ''AGUARDANDO'', solicitar_emissor = ''EMISSAO'', status_motivo = null ' +
+      'where numdoc = :numdoc ' +
+      '  and faturado = 0 and exists (select 1 from ml_pedido mp where mp.order_id = :order_id ' +
+      '              and mp.taxa_ml is not null and mp.taxa_frete is not null)';
+    Q.ParamByName('numdoc').AsInteger := NumDoc;
+    Q.ParamByName('order_id').AsString := OrderId;
+    Q.ExecSQL;
+  finally
+    Q.Free;
+  end;
+end;
+
+// Chamado a cada ciclo do Run: solicita emissao para os pedidos com taxa_ml e taxa_frete preenchidas.
+// Nao mexe em vendas1 que ja esta AGUARDANDO ou CONCLUIDO, para nao repetir a solicitacao a cada ciclo.
+procedure TMercadoLivreRepository.SolicitarEmissaoPendentes;
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'update vendas1 v set status_emissor = ''AGUARDANDO'', solicitar_emissor = ''EMISSAO'', status_motivo = null ' +
+      'where v.faturado = 0 and coalesce(v.status_emissor, '''') not in (''AGUARDANDO'', ''CONCLUIDO'') ' +
+      '  and exists (select 1 from ml_pedido mp where mp.numdoc = v.numdoc ' +
+      '              and mp.taxa_ml is not null and mp.taxa_frete is not null)';
+    Q.ExecSQL;
+    if Q.RowsAffected > 0 then
+      FLog.Info('Emissao solicitada no ORBI para ' + IntToStr(Q.RowsAffected) + ' venda(s)');
   finally
     Q.Free;
   end;
@@ -880,6 +1074,24 @@ begin
     Q.Connection := FConn;
     Q.SQL.Text :=
       'update ml_nfe_envio set status = ''ENVIADO'', erro = null, enviado_em = current_timestamp, atualizado_em = current_timestamp where id = :id';
+    Q.ParamByName('id').AsInteger := Id;
+    Q.ExecSQL;
+  finally
+    Q.Free;
+  end;
+end;
+
+// Pedido faturado pelo Mercado Livre (fulfillment, xd_drop_off, cross_docking ou erro 403 de faturador):
+// nao reenvia o XML e nao entra mais na fila de envio (status diferente de PENDENTE/ERRO)
+procedure TMercadoLivreRepository.MarkNFeEmitidaML(const Id: Integer);
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text :=
+      'update ml_nfe_envio set status = ''EMITIDA_ML'', atualizado_em = current_timestamp where id = :id';
     Q.ParamByName('id').AsInteger := Id;
     Q.ExecSQL;
   finally

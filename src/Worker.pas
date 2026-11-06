@@ -100,7 +100,8 @@ begin
         // Frete pago pelo vendedor: busca em pedidos novos e nos ja importados sem frete gravado
         BuscaFrete := (not JaImp) or FRepo.FreteFaltando(OrderId);
 
-        if not JaImp then
+        // CPF/CNPJ tambem para pedidos ja importados que serao reprocessados (Precisa), senao o cliente nao e localizado
+        if Precisa then
         begin
           try
             Detail.AddPair('doc_comprador', FClient.GetBillingDoc(OrderId));
@@ -197,14 +198,31 @@ end;
 procedure TWorker.EnviarNotas;
 var
   Id: Integer;
-  PackId, ShipmentId, XmlText: string;
+  PackId, ShipmentId, XmlText, Tipo: string;
   JaEnviada: Boolean;
 begin
   FRepo.CriarPendenciasNFe;
 
   while FRepo.NextNFePendente(Id, PackId, ShipmentId, XmlText) do
   begin
+    // Pedido sem envio (ex.: retirada) grava o texto 'null' no shipment_id: trata como vazio
+    if SameText(Trim(ShipmentId), 'null') then
+      ShipmentId := '';
+    if SameText(Trim(PackId), 'null') then
+      PackId := '';
+
     try
+      // Envio com tipo logistico que o Mercado Livre fatura sozinho: nao envia, so marca
+      Tipo := '';
+      if ShipmentId <> '' then
+        Tipo := FClient.LogisticType(ShipmentId);
+      if (Tipo = 'fulfillment') or (Tipo = 'xd_drop_off') or (Tipo = 'cross_docking') then
+      begin
+        FRepo.MarkNFeEmitidaML(Id);
+        FLog.Info('NF-e id ' + IntToStr(Id) + ' emitida pelo Mercado Livre (logistic ' + Tipo + '), nao enviada');
+        Continue;
+      end;
+
       // Consulta o Mercado Livre antes de enviar, para nao duplicar a NF-e
       JaEnviada := FClient.NFeJaEnviada(PackId, ShipmentId);
       if JaEnviada then
@@ -214,6 +232,13 @@ begin
     except
       on E: Exception do
       begin
+        // 403 "must use the biller": o Mercado Livre e o emissor deste pedido; nao reenvia
+        if Pos('must use the biller', E.Message) > 0 then
+        begin
+          FRepo.MarkNFeEmitidaML(Id);
+          FLog.Info('NF-e id ' + IntToStr(Id) + ' exige faturador do Mercado Livre, marcada como EMITIDA_ML');
+          Continue;
+        end;
         FRepo.MarkNFeErro(Id, E.Message);
         FLog.Error('Falha ao enviar NF-e ao Mercado Livre (id ' + IntToStr(Id) + '): ' + E.Message);
         Break;
@@ -233,8 +258,11 @@ begin
       if FConfig.ImportarPedidos then
         ImportarPedidos;
 
-     { if FConfig.EnviarNotas then
-        EnviarNotas;}
+      // Solicita a emissao no ORBI para pedidos com taxa_ml e taxa_frete preenchidas
+      FRepo.SolicitarEmissaoPendentes;
+
+      if FConfig.EnviarNotas then
+        EnviarNotas;
     except
       on E: Exception do
         FLog.Error(E.Message);

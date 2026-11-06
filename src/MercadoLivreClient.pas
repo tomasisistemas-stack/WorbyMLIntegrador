@@ -35,6 +35,7 @@ type
     function GetBillingEndereco(const OrderId: string): TJSONObject;
     function GetReceiverAddress(const ShipmentId: string): TJSONObject;
     function GetFreteVendedor(const ShipmentId: string): Double;
+    function LogisticType(const ShipmentId: string): string;
     function NFeJaEnviada(const PackId, ShipmentId: string): Boolean;
     procedure SendInvoiceXml(const PackId, ShipmentId, XmlText: string);
   end;
@@ -77,20 +78,31 @@ var
   NewRefresh: TJSONValue;
   Body: string;
 begin
-  if (Trim(FAccessToken) <> '') and ((FTokenExpiresAt = 0) or (FTokenExpiresAt > IncMinute(Now, 5))) then
-    Exit;
-
-  if Trim(FRefreshToken) = '' then
+  // Token valido so se houver data de validade e ela ainda nao venceu (sem data = renova)
+  if (Trim(FAccessToken) <> '') and (FTokenExpiresAt > IncMinute(Now, 5)) then
     Exit;
 
   if (Trim(FConfig.ClientId) = '') or (Trim(FConfig.ClientSecret) = '') then
     raise Exception.Create('client_id/client_secret do Mercado Livre nao configurados');
 
-  Body :=
-    'grant_type=refresh_token' +
-    '&client_id=' + TNetEncoding.URL.Encode(FConfig.ClientId) +
-    '&client_secret=' + TNetEncoding.URL.Encode(FConfig.ClientSecret) +
-    '&refresh_token=' + TNetEncoding.URL.Encode(FRefreshToken);
+  if Trim(FConfig.AuthorizationCode) <> '' then
+    // Codigo de autorizacao colado no config.ini: troca por tokens (so vale uma vez)
+    Body :=
+      'grant_type=authorization_code' +
+      '&client_id=' + TNetEncoding.URL.Encode(FConfig.ClientId) +
+      '&client_secret=' + TNetEncoding.URL.Encode(FConfig.ClientSecret) +
+      '&code=' + TNetEncoding.URL.Encode(FConfig.AuthorizationCode) +
+      '&redirect_uri=' + TNetEncoding.URL.Encode(FConfig.RedirectUri)
+  else
+  begin
+    if Trim(FRefreshToken) = '' then
+      raise Exception.Create('Sem refresh_token do Mercado Livre: gere um novo authorization_code e grave em authorization_code no config.ini');
+    Body :=
+      'grant_type=refresh_token' +
+      '&client_id=' + TNetEncoding.URL.Encode(FConfig.ClientId) +
+      '&client_secret=' + TNetEncoding.URL.Encode(FConfig.ClientSecret) +
+      '&refresh_token=' + TNetEncoding.URL.Encode(FRefreshToken);
+  end;
 
   Source := TStringStream.Create(Body, TEncoding.UTF8);
   try
@@ -98,7 +110,7 @@ begin
       [TNameValuePair.Create('Content-Type', 'application/x-www-form-urlencoded')]);
 
     if (Resp.StatusCode < 200) or (Resp.StatusCode > 299) then
-      raise Exception.CreateFmt('Refresh token Mercado Livre retornou %d: %s',
+      raise Exception.CreateFmt('Troca/renovacao de token Mercado Livre retornou %d: %s (se persistir, gere um novo authorization_code e grave no config.ini)',
         [Resp.StatusCode, Resp.ContentAsString(TEncoding.UTF8)]);
 
     Json := TJSONObject.ParseJSONValue(Resp.ContentAsString(TEncoding.UTF8));
@@ -114,7 +126,13 @@ begin
       ExpiresIn := StrToIntDef(Obj.GetValue('expires_in').Value, 10800);
       FTokenExpiresAt := IncSecond(Now, ExpiresIn);
       FConfig.SaveMercadoLivreToken(FAccessToken, FRefreshToken, FTokenExpiresAt);
-      FLog.Info('Token Mercado Livre renovado');
+      if Trim(FConfig.AuthorizationCode) <> '' then
+      begin
+        FConfig.ClearAuthorizationCode;
+        FLog.Info('authorization_code trocado por tokens do Mercado Livre');
+      end
+      else
+        FLog.Info('Token Mercado Livre renovado');
     finally
       Json.Free;
     end;
@@ -130,6 +148,14 @@ var
 begin
   Resp := FHttp.Get('https://api.mercadolibre.com' + Resource, nil,
     [TNameValuePair.Create('Authorization', AuthHeader)]);
+
+  // Token recusado pelo Mercado Livre: forca a renovacao e tenta uma vez
+  if Resp.StatusCode = 401 then
+  begin
+    FTokenExpiresAt := 0;
+    Resp := FHttp.Get('https://api.mercadolibre.com' + Resource, nil,
+      [TNameValuePair.Create('Authorization', AuthHeader)]);
+  end;
 
   if (Resp.StatusCode < 200) or (Resp.StatusCode > 299) then
     raise Exception.CreateFmt('Mercado Livre GET %s retornou %d: %s',
@@ -216,6 +242,27 @@ begin
   end;
 end;
 
+// Tipo logistico do envio (logistic.type de /shipments/{id}): fulfillment, xd_drop_off, cross_docking, drop_off...
+function TMercadoLivreClient.LogisticType(const ShipmentId: string): string;
+var
+  Obj, Logistic: TJSONObject;
+  V: TJSONValue;
+begin
+  Result := '';
+  Obj := GetJson('/shipments/' + TNetEncoding.URL.Encode(ShipmentId));
+  try
+    if Obj.GetValue('logistic') is TJSONObject then
+    begin
+      Logistic := TJSONObject(Obj.GetValue('logistic'));
+      V := Logistic.GetValue('type');
+      if V <> nil then
+        Result := V.Value;
+    end;
+  finally
+    Obj.Free;
+  end;
+end;
+
 // Retorna somente os digitos do CPF/CNPJ do comprador (endpoint billing_info do pedido)
 function TMercadoLivreClient.GetBillingDoc(const OrderId: string): string;
 var
@@ -255,9 +302,9 @@ var
 begin
   Result := False;
 
-  if (Trim(PackId) <> '') and (Trim(PackId) <> 'null') then
+ { if (Trim(PackId) <> '') and (Trim(PackId) <> 'null') then
     Url := 'https://api.mercadolibre.com/packs/' + TNetEncoding.URL.Encode(PackId) + '/fiscal_documents'
-  else if (Trim(ShipmentId) <> '') and (Trim(ShipmentId) <> 'null') then
+  else } if (Trim(ShipmentId) <> '') and (Trim(ShipmentId) <> 'null') then
     Url := 'https://api.mercadolibre.com/shipments/' + TNetEncoding.URL.Encode(ShipmentId) + '/invoice_data?siteId=' + FConfig.SiteId
   else
     Exit;

@@ -22,6 +22,7 @@ type
     RedirectUri: string;
     AccessToken: string;
     RefreshToken: string;
+    AuthorizationCode: string;
     TokenExpiresAt: TDateTime;
     PollIntervalMs: Integer;
     ImportarPedidos: Boolean;
@@ -35,6 +36,7 @@ type
 
     class function Load(const FileName: string): TAppConfig; static;
     procedure SaveMercadoLivreToken(const NewAccessToken, NewRefreshToken: string; const NewExpiresAt: TDateTime);
+    procedure ClearAuthorizationCode;
   end;
 
 implementation
@@ -61,6 +63,7 @@ begin
     Result.RedirectUri := Ini.ReadString('mercadolivre', 'redirect_uri', '');
     Result.AccessToken := Ini.ReadString('mercadolivre', 'access_token', '');
     Result.RefreshToken := Ini.ReadString('mercadolivre', 'refresh_token', '');
+    Result.AuthorizationCode := Ini.ReadString('mercadolivre', 'authorization_code', '');
     Result.TokenExpiresAt := StrToDateTimeDef(Ini.ReadString('mercadolivre', 'token_expires_at', ''), 0);
 
     Result.PollIntervalMs := Ini.ReadInteger('worker', 'poll_interval_ms', 60000);
@@ -91,6 +94,23 @@ begin
     if Trim(NewRefreshToken) <> '' then
       Ini.WriteString('mercadolivre', 'refresh_token', NewRefreshToken);
     Ini.WriteString('mercadolivre', 'token_expires_at', DateTimeToStr(NewExpiresAt));
+  finally
+    Ini.Free;
+  end;
+end;
+
+// Apaga o authorization_code depois de usado (ele so vale uma vez)
+procedure TAppConfig.ClearAuthorizationCode;
+var
+  Ini: TIniFile;
+begin
+  AuthorizationCode := '';
+  if Trim(ConfigFileName) = '' then
+    Exit;
+
+  Ini := TIniFile.Create(ConfigFileName);
+  try
+    Ini.WriteString('mercadolivre', 'authorization_code', '');
   finally
     Ini.Free;
   end;
